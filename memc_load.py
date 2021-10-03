@@ -38,7 +38,7 @@ def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
     try:
         if dry_run:
             logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-            print('{} successfully load {} -> {}'.format(threading.current_thread(), key, str(ua)))
+            print("Thread {} load {} -> {}".format(threading.current_thread(), key, str(ua).replace("\n", " ")))
         else:
             memc = Client(memc_addr)
             memc.set(key, packed)
