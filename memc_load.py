@@ -7,8 +7,10 @@ import glob
 import logging
 import collections
 import threading
+import queue
+import time
 from optparse import OptionParser
-from queue import Queue
+import multiprocessing as mp
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
 # pip install protobuf
@@ -20,7 +22,8 @@ NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
-def dot_rename(path):
+def dot_rename(argms):
+    path = argms[-1]
     head, fn = os.path.split(path)
     # atomic in most cases
     os.rename(path, os.path.join(head, "." + fn))
@@ -38,7 +41,6 @@ def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
     try:
         if dry_run:
             logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
-            print("Thread {} load {} -> {}".format(threading.current_thread(), key, str(ua).replace("\n", " ")))
         else:
             memc = Client(memc_addr)
             memc.set(key, packed)
@@ -67,63 +69,97 @@ def parse_appsinstalled(line):
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
-def process_file(file, device_memc, options):
-    processed = errors = 0
-    fd = gzip.open(file)
-    for line in fd:
-        line = line.decode('utf-8').strip()
-        print('{} took line {}'.format(threading.current_thread(), line))
-        if not line:
-            continue
-        appsinstalled = parse_appsinstalled(line)
-        print('{} took state {}'.format(threading.current_thread(), appsinstalled))
-        if not appsinstalled:
-            errors += 1
-            continue
-        memc_addr = device_memc.get(appsinstalled.dev_type)
-        if not memc_addr:
-            errors += 1
-            logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-            continue
-        ok = insert_appsinstalled(memc_addr, appsinstalled, options.dry)
-        print('{} successfully load {}'.format(threading.current_thread(), ok))
-        if ok:
-            processed += 1
-        else:
-            errors += 1
-        print('{} processed number {} errors number {}'.format(threading.current_thread(), processed, errors))
-    if processed:
-        err_rate = float(errors) / processed
-        if err_rate < NORMAL_ERR_RATE:
-            logging.info("Acceptable error rate (%s). Successfull load" % err_rate)
-        else:
-            logging.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
-    fd.close()
-
-
 class Worker(threading.Thread):
-    def __init__(self, queue, device_memc, options, lock):
+    def __init__(self, queue_load, queue_data, device_memc):
         threading.Thread.__init__(self)
-        self.queue = queue
-        self.lock = lock
+        self.queue_load = queue_load
+        self.queue_data = queue_data
         self.memc_dict = device_memc
-        self.options = options
 
     def run(self):
         while True:
-            file_ex = self.queue.get()
-            try:
-                process_file(file_ex, self.memc_dict, self.options)
-                with self.lock:
-                    print(f'Th: {self.name} treat {file_ex} file')
-                    dot_rename(file_ex)
-            except Exception as e:
-                logging.info("Exception {} occurred with processing file {}".format(e, file_ex))
-            finally:
-                self.queue.task_done()
+            content = self.queue_load.get()
+            if isinstance(content, str) and content == 'quit':
+                self.queue_load.task_done()
+                break
+
+            self.queue_load.task_done()
+            line, device_dict, options = content
+            result = self.parse_line(line, device_dict)
+            if len(result) == 1:
+                res_req = (result, 0)
+            else:
+                er, app, adr = result
+                ok = insert_appsinstalled(adr, app, options.dry)
+                if ok:
+                    res_req = (0, 1)
+                else:
+                    res_req = (1, 0)
+            self.queue_data.put(res_req)
+
+    def parse_line(self, line, device_memc):
+        errors = 0
+        line = line.decode('utf-8').strip()
+        if not line:
+            return errors
+        appsinstalled = parse_appsinstalled(line)
+        if not appsinstalled:
+            errors = 1
+            return errors
+        memc_addr = device_memc.get(appsinstalled.dev_type)
+        if not memc_addr:
+            errors = 1
+            logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+            return errors
+        return errors, appsinstalled, memc_addr
+
+
+def process_file(argms):
+    options, device_memc, file = argms
+    logger = create_logger(options)
+    queue_load = queue.Queue()
+    queue_data = queue.Queue()
+    workers = []
+    for _ in range(options.num_workers):
+        worker = Worker(queue_load, queue_data, device_memc)
+        worker.daemon = True
+        worker.start()
+        workers.append(worker)
+
+    fd = gzip.open(file)
+    s = time.time()
+    for line in fd:
+        queue_load.put((line, device_memc, options))
+    for _ in workers:
+        queue_load.put('quit')
+
+    queue_load.join()
+
+    processed = errors = 0
+    while not queue_data.empty():
+        r = queue_data.get()
+        processed += r[1]
+        errors += r[0]
+    # print('processed number {} errors number {}'.format(processed, errors))
+    if processed:
+        err_rate = float(errors) / processed
+        if err_rate < NORMAL_ERR_RATE:
+            logger.info("Acceptable error rate (%s). Successfull load" % err_rate)
+            print('Been processed')
+        else:
+            logger.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
+            print('Error processed')
+
+    fd.close()
+
+    for w in workers:
+        w.join()
+    print('Exit')
+    logger.info("%s processed in %s sec" % (file, time.time() - s))
 
 
 def main(options):
+    logger = create_logger(options)
     device_memc = {
         "idfa": options.idfa,
         "gaid": options.gaid,
@@ -131,19 +167,14 @@ def main(options):
         "dvid": options.dvid,
     }
 
-    files_queue = Queue()
+    files_list = []
     for fn in glob.iglob(options.pattern):
-        files_queue.put(fn)
-
-    if files_queue.empty():
-        logging.info("There are no files to load")
-    else:
-        lock = threading.Lock()
-        for _ in range(os.cpu_count()):
-            th = Worker(files_queue, device_memc, options, lock)
-            th.daemon = True
-            th.start()
-        files_queue.join()
+        files_list.append((options, device_memc, fn))
+    files_list = sorted(files_list, key=lambda x: x[-1])
+    with mp.get_context('spawn').Pool(os.cpu_count()) as p:
+        p.map(process_file, files_list)
+        p.map(dot_rename, files_list)
+    logger.info('Process {} finished'.format(mp.current_process().name))
 
 
 def prototest():
@@ -162,10 +193,31 @@ def prototest():
         assert ua == unpacked
 
 
+def create_logger(opt):
+    logger = mp.get_logger()
+    if not opt.dry:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.DEBUG)
+    formatter = logging.Formatter(
+        '[%(asctime)s| %(levelname).1s| %(processName)s] %(message)s',
+        datefmt='%Y.%m.%d %H:%M:%S')
+    handler = logging.FileHandler(opt.log)
+    handler.setFormatter(formatter)
+
+    # this bit will make sure you won't have
+    # duplicated messages in the output
+    if not len(logger.handlers):
+        logger.addHandler(handler)
+    return logger
+
+
+
 if __name__ == '__main__':
     op = OptionParser()
     op.add_option("-t", "--test", action="store_true", default=False)
     op.add_option("-l", "--log", action="store", default=None)
+    op.add_option("-w", "--num_workers", action="store", type=int, default=4)
     op.add_option("--dry", action="store_true", default=False)
     op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
     op.add_option("--idfa", action="store", default="127.0.0.1:33013")
@@ -173,15 +225,16 @@ if __name__ == '__main__':
     op.add_option("--adid", action="store", default="127.0.0.1:33015")
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     (opts, args) = op.parse_args()
-    logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
-                        format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
+    logger = create_logger(opts)
+    # logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
+    #                     format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
         prototest()
         sys.exit(0)
 
-    logging.info("Memc loader started with options: %s" % opts)
+    logger.info("Memc loader started with options: %s" % opts)
     try:
         main(opts)
     except Exception as e:
-        logging.exception("Unexpected error: %s" % e)
+        logger.exception("Unexpected error: %s" % e)
         sys.exit(1)
