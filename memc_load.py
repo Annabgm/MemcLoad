@@ -22,13 +22,11 @@ NORMAL_ERR_RATE = 0.01
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
-def dot_rename(argms):
-    path = argms[-1]
-    head, fn = os.path.split(path)
-    # atomic in most cases
-    os.rename(path, os.path.join(head, "." + fn))
-
-
+# def dot_rename(argms):
+#     path = argms[-1]
+#     head, fn = os.path.split(path)
+#     # atomic in most cases
+#     os.rename(path, os.path.join(head, "." + fn))
 def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
     ua = appsinstalled_pb2.UserApps()
     ua.lat = appsinstalled.lat
@@ -96,6 +94,7 @@ class Worker(threading.Thread):
                 else:
                     res_req = (1, 0)
             self.queue_data.put(res_req)
+            self.queue_load.task_done()
 
     def parse_line(self, line, device_memc):
         errors = 0
@@ -145,17 +144,15 @@ def process_file(argms):
         err_rate = float(errors) / processed
         if err_rate < NORMAL_ERR_RATE:
             logger.info("Acceptable error rate (%s). Successfull load" % err_rate)
-            print('Been processed')
         else:
             logger.error("High error rate (%s > %s). Failed load" % (err_rate, NORMAL_ERR_RATE))
-            print('Error processed')
-
-    fd.close()
 
     for w in workers:
         w.join()
-    print('Exit')
     logger.info("%s processed in %s sec" % (file, time.time() - s))
+    head, fn = os.path.split(file)
+    os.rename(file, os.path.join(head, "." + fn))
+    logger.info("%s been renamed to %s.%s" % (file, head, fn))
 
 
 def main(options):
@@ -173,7 +170,7 @@ def main(options):
     files_list = sorted(files_list, key=lambda x: x[-1])
     with mp.get_context('spawn').Pool(os.cpu_count()) as p:
         p.map(process_file, files_list)
-        p.map(dot_rename, files_list)
+        # p.map(dot_rename, files_list)
     logger.info('Process {} finished'.format(mp.current_process().name))
 
 
@@ -226,8 +223,6 @@ if __name__ == '__main__':
     op.add_option("--dvid", action="store", default="127.0.0.1:33016")
     (opts, args) = op.parse_args()
     logger = create_logger(opts)
-    # logging.basicConfig(filename=opts.log, level=logging.INFO if not opts.dry else logging.DEBUG,
-    #                     format='[%(asctime)s] %(levelname).1s %(message)s', datefmt='%Y.%m.%d %H:%M:%S')
     if opts.test:
         prototest()
         sys.exit(0)
