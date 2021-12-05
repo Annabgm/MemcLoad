@@ -9,6 +9,7 @@ import collections
 import threading
 import queue
 import time
+from itertools import islice
 from optparse import OptionParser
 import multiprocessing as mp
 # brew install protobuf
@@ -19,14 +20,11 @@ import appsinstalled_pb2
 from pymemcache.client.base import Client
 
 NORMAL_ERR_RATE = 0.01
+CHUNK_SIZE = 48
+MEMCACHE_SOCKET_TIMEOUT = 2
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
-# def dot_rename(argms):
-#     path = argms[-1]
-#     head, fn = os.path.split(path)
-#     # atomic in most cases
-#     os.rename(path, os.path.join(head, "." + fn))
 def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
     ua = appsinstalled_pb2.UserApps()
     ua.lat = appsinstalled.lat
@@ -81,36 +79,38 @@ class Worker(threading.Thread):
                 self.queue_load.task_done()
                 break
 
-            self.queue_load.task_done()
-            line, device_dict, options = content
-            result = self.parse_line(line, device_dict)
-            if len(result) == 1:
-                res_req = (result, 0)
+            lines, device_dict, options = content
+            err, devices = self.parse_lines(lines, device_dict)
+            if not len(devices):
+                res_req = (err, 0)
             else:
-                er, app, adr = result
-                ok = insert_appsinstalled(adr, app, options.dry)
-                if ok:
-                    res_req = (0, 1)
-                else:
-                    res_req = (1, 0)
+                success = 0
+                fail = err
+                for d in devices:
+                    app, adr = d
+                    ok = insert_appsinstalled(adr, app, options.dry)
+                    success += ok
+                    fail = fail + 1 - ok
+                res_req = (fail, success)
             self.queue_data.put(res_req)
             self.queue_load.task_done()
 
-    def parse_line(self, line, device_memc):
+    def parse_lines(self, lines, device_memc):
         errors = 0
-        line = line.decode('utf-8').strip()
-        if not line:
-            return errors
-        appsinstalled = parse_appsinstalled(line)
-        if not appsinstalled:
-            errors = 1
-            return errors
-        memc_addr = device_memc.get(appsinstalled.dev_type)
-        if not memc_addr:
-            errors = 1
-            logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-            return errors
-        return errors, appsinstalled, memc_addr
+        apps_list = []
+        for ln in lines:
+            line = ln.decode('utf-8').strip()
+            appsinstalled = parse_appsinstalled(line)
+            if not appsinstalled:
+                errors += 1
+                continue
+            memc_addr = device_memc.get(appsinstalled.dev_type)
+            if not memc_addr:
+                errors += 1
+                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
+                # return errors
+            apps_list.append((appsinstalled, memc_addr))
+        return errors, apps_list
 
 
 def process_file(argms):
@@ -125,10 +125,10 @@ def process_file(argms):
         worker.start()
         workers.append(worker)
 
-    fd = gzip.open(file)
     s = time.time()
-    for line in fd:
-        queue_load.put((line, device_memc, options))
+    with gzip.open(file) as fl:
+        lns = list(islice(fl, CHUNK_SIZE))
+        queue_load.put((lns, device_memc, options))
     for _ in workers:
         queue_load.put('quit')
 
@@ -209,7 +209,6 @@ def create_logger(opt):
     return logger
 
 
-
 if __name__ == '__main__':
     op = OptionParser()
     op.add_option("-t", "--test", action="store_true", default=False)
@@ -217,10 +216,10 @@ if __name__ == '__main__':
     op.add_option("-w", "--num_workers", action="store", type=int, default=4)
     op.add_option("--dry", action="store_true", default=False)
     op.add_option("--pattern", action="store", default="/data/appsinstalled/*.tsv.gz")
-    op.add_option("--idfa", action="store", default="127.0.0.1:33013")
-    op.add_option("--gaid", action="store", default="127.0.0.1:33014")
-    op.add_option("--adid", action="store", default="127.0.0.1:33015")
-    op.add_option("--dvid", action="store", default="127.0.0.1:33016")
+    op.add_option("--idfa", action="store", default="127.0.0.1:11211")
+    op.add_option("--gaid", action="store", default="127.0.0.1:11212")
+    op.add_option("--adid", action="store", default="127.0.0.1:11213")
+    op.add_option("--dvid", action="store", default="127.0.0.1:11214")
     (opts, args) = op.parse_args()
     logger = create_logger(opts)
     if opts.test:
