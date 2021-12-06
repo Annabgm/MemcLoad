@@ -11,6 +11,7 @@ import queue
 import time
 from itertools import islice
 from optparse import OptionParser
+import collections
 import multiprocessing as mp
 # brew install protobuf
 # protoc  --python_out=. ./appsinstalled.proto
@@ -18,30 +19,41 @@ import multiprocessing as mp
 import appsinstalled_pb2
 # pip install python-memcached
 from pymemcache.client.base import Client
+from pymemcache.client.retrying import RetryingClient
+from pymemcache.exceptions import MemcacheUnexpectedCloseError
+
 
 NORMAL_ERR_RATE = 0.01
-CHUNK_SIZE = 48
+CHUNK_SIZE = 128
 MEMCACHE_SOCKET_TIMEOUT = 2
+RETRY_DELAY = 0.01
+RETRY_ATTEMPTS = 3
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
 def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
-    ua = appsinstalled_pb2.UserApps()
-    ua.lat = appsinstalled.lat
-    ua.lon = appsinstalled.lon
-    key = "%s:%s" % (appsinstalled.dev_type, appsinstalled.dev_id)
-    ua.apps.extend(appsinstalled.apps)
-    packed = ua.SerializeToString()
+    elements = {}
+    elements_ua = {}
+    dev_type = appsinstalled[0].dev_type
+    for ap in appsinstalled:
+        ua = appsinstalled_pb2.UserApps()
+        ua.lat = ap.lat
+        ua.lon = ap.lon
+        key = "%s:%s" % (ap.dev_type, ap.dev_id)
+        ua.apps.extend(ap.apps)
+        packed = ua.SerializeToString()
+        elements[key] = packed
+        elements_ua[key] = ua
     # @TODO persistent connection
     # @TODO retry and timeouts!
     try:
         if dry_run:
-            logging.debug("%s - %s -> %s" % (memc_addr, key, str(ua).replace("\n", " ")))
+            for el_k, el_v in elements_ua.items():
+                logging.debug("%s - %s -> %s" % (memc_addr, el_k, str(el_v).replace("\n", " ")))
         else:
-            memc = Client(memc_addr)
-            memc.set(key, packed)
+            memc_addr.set_many(elements)
     except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (memc_addr, e))
+        logging.exception("Cannot write to memc %s: %s" % (dev_type, e))
         return False
     return True
 
@@ -80,24 +92,25 @@ class Worker(threading.Thread):
                 break
 
             lines, device_dict, options = content
-            err, devices = self.parse_lines(lines, device_dict)
-            if not len(devices):
+            err, suc, devices = self.parse_lines(lines, device_dict)
+            if not suc:
                 res_req = (err, 0)
             else:
                 success = 0
                 fail = err
-                for d in devices:
-                    app, adr = d
-                    ok = insert_appsinstalled(adr, app, options.dry)
-                    success += ok
-                    fail = fail + 1 - ok
+                for d, aps in devices.items():
+                    # app, adr = d
+                    ok = insert_appsinstalled(device_dict[d], aps, options.dry)
+                    success += len(aps)
+                    fail = fail + (1 - ok) * len(aps)
                 res_req = (fail, success)
             self.queue_data.put(res_req)
             self.queue_load.task_done()
 
     def parse_lines(self, lines, device_memc):
         errors = 0
-        apps_list = []
+        apps_dict = collections.defaultdict(list)
+        success = 0
         for ln in lines:
             line = ln.decode('utf-8').strip()
             appsinstalled = parse_appsinstalled(line)
@@ -107,20 +120,36 @@ class Worker(threading.Thread):
             memc_addr = device_memc.get(appsinstalled.dev_type)
             if not memc_addr:
                 errors += 1
-                logging.error("Unknow device type: %s" % appsinstalled.dev_type)
-                # return errors
-            apps_list.append((appsinstalled, memc_addr))
-        return errors, apps_list
+                logger.error("Unknown device type: %s" % appsinstalled.dev_type)
+                continue
+            apps_dict[appsinstalled.dev_type].append(appsinstalled)
+            success += 1
+        return errors, success, apps_dict
 
+
+def create_cliens_pool(memc_dict):
+    memc_clients = {}
+    for k, v in memc_dict.items():
+        base_client = Client(v, connect_timeout=2., timeout=0.5)
+        client = RetryingClient(
+            base_client,
+            attempts=RETRY_ATTEMPTS,
+            retry_delay=RETRY_DELAY,
+            retry_for=[MemcacheUnexpectedCloseError]
+        )
+        memc_clients[k] = client
+    return memc_clients
 
 def process_file(argms):
     options, device_memc, file = argms
     logger = create_logger(options)
+    memc_clients = create_cliens_pool(device_memc)
+
     queue_load = queue.Queue()
     queue_data = queue.Queue()
     workers = []
     for _ in range(options.num_workers):
-        worker = Worker(queue_load, queue_data, device_memc)
+        worker = Worker(queue_load, queue_data, memc_clients)
         worker.daemon = True
         worker.start()
         workers.append(worker)
@@ -128,7 +157,7 @@ def process_file(argms):
     s = time.time()
     with gzip.open(file) as fl:
         lns = list(islice(fl, CHUNK_SIZE))
-        queue_load.put((lns, device_memc, options))
+        queue_load.put((lns, memc_clients, options))
     for _ in workers:
         queue_load.put('quit')
 
