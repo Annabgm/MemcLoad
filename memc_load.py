@@ -31,7 +31,8 @@ RETRY_ATTEMPTS = 3
 AppsInstalled = collections.namedtuple("AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"])
 
 
-def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
+def insert_appsinstalled(memc_addr, appsinstalled, options):
+    logger = create_logger(options)
     elements = {}
     elements_ua = {}
     dev_type = appsinstalled[0].dev_type
@@ -47,18 +48,19 @@ def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
     # @TODO persistent connection
     # @TODO retry and timeouts!
     try:
-        if dry_run:
+        if options.dry:
             for el_k, el_v in elements_ua.items():
-                logging.debug("%s - %s -> %s" % (memc_addr, el_k, str(el_v).replace("\n", " ")))
+                logger.debug("%s - %s -> %s" % (memc_addr, el_k, str(el_v).replace("\n", " ")))
         else:
             memc_addr.set_many(elements)
     except Exception as e:
-        logging.exception("Cannot write to memc %s: %s" % (dev_type, e))
+        logger.exception("Cannot write to memc %s: %s" % (dev_type, e))
         return False
     return True
 
 
-def parse_appsinstalled(line):
+def parse_appsinstalled(line, options):
+    logger = create_logger(options)
     line_parts = line.strip().split("\t")
     if len(line_parts) < 5:
         return
@@ -69,11 +71,11 @@ def parse_appsinstalled(line):
         apps = [int(a.strip()) for a in raw_apps.split(",")]
     except ValueError:
         apps = [int(a.strip()) for a in raw_apps.split(",") if a.isidigit()]
-        logging.info("Not all user apps are digits: `%s`" % line)
+        logger.info("Not all user apps are digits: `%s`" % line)
     try:
         lat, lon = float(lat), float(lon)
     except ValueError:
-        logging.info("Invalid geo coords: `%s`" % line)
+        logger.info("Invalid geo coords: `%s`" % line)
     return AppsInstalled(dev_type, dev_id, lat, lon, apps)
 
 
@@ -92,7 +94,7 @@ class Worker(threading.Thread):
                 break
 
             lines, device_dict, options = content
-            err, suc, devices = self.parse_lines(lines, device_dict)
+            err, suc, devices = self.parse_lines(lines, device_dict, options)
             if not suc:
                 res_req = (err, 0)
             else:
@@ -100,20 +102,20 @@ class Worker(threading.Thread):
                 fail = err
                 for d, aps in devices.items():
                     # app, adr = d
-                    ok = insert_appsinstalled(device_dict[d], aps, options.dry)
+                    ok = insert_appsinstalled(device_dict[d], aps, options)
                     success += len(aps)
                     fail = fail + (1 - ok) * len(aps)
                 res_req = (fail, success)
             self.queue_data.put(res_req)
             self.queue_load.task_done()
 
-    def parse_lines(self, lines, device_memc):
+    def parse_lines(self, lines, device_memc, options):
         errors = 0
         apps_dict = collections.defaultdict(list)
         success = 0
         for ln in lines:
             line = ln.decode('utf-8').strip()
-            appsinstalled = parse_appsinstalled(line)
+            appsinstalled = parse_appsinstalled(line, options)
             if not appsinstalled:
                 errors += 1
                 continue
