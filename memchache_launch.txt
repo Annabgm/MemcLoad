@@ -1,0 +1,10 @@
+`memcached.exe -d install`
+`c:\memcached\memcached.exe -d start`
+`memcached.exe -d stop`
+`memcached.exe -d uninstall`
+
+Запуск несколько независимым объектов:
+`sc create "Memcached11211" binPath= "C:\memcached\memcached.exe -d runservice -p 11211"  DisplayName= "Memcached11211" start= auto`
+`sc start Memcached11211`
+`sc stop memcached11211`
+`sc delete memcached11212`
